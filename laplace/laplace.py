@@ -25,6 +25,7 @@ def Laplace(model, likelihood, subset_of_weights='last_layer', hessian_structure
 
     laplace_map = {subclass._key: subclass for subclass in _all_subclasses(ParametricLaplace)
                    if hasattr(subclass, '_key')}
+
     laplace_class = laplace_map[(subset_of_weights, hessian_structure)]
     return laplace_class(model, likelihood, *args, **kwargs)
 

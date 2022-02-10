@@ -1,3 +1,4 @@
+from builtins import breakpoint
 from math import sqrt, pi, log
 import numpy as np
 import torch
@@ -492,7 +493,7 @@ class ParametricLaplace(BaseLaplace):
 
         return self.log_likelihood - 0.5 * (self.log_det_ratio + self.scatter)
 
-    def __call__(self, x, pred_type='glm', link_approx='probit', n_samples=100):
+    def __call__(self, x, pred_type='glm', link_approx='probit', n_samples=100, return_latent_representation=True):
         """Compute the posterior predictive on input data `X`.
 
         Parameters
@@ -549,10 +550,89 @@ class ParametricLaplace(BaseLaplace):
                 dist = Dirichlet(alpha)
                 return torch.nan_to_num(dist.mean, nan=1.0)
         else:
-            samples = self._nn_predictive_samples(x, n_samples)
+            samples = self._nn_predictive_samples(x, n_samples, return_latent_representation = return_latent_representation)
             if self.likelihood == 'regression':
-                return samples.mean(dim=0), samples.var(dim=0)
+                if isinstance(samples, tuple):
+                    samples, samples_latent = samples
+                    return samples.mean(dim=0), samples.var(dim=0), samples_latent.mean(dim=0), samples_latent.var(dim=0)
+                else:
+                    return samples.mean(dim=0), samples.var(dim=0)
+                    
             return samples.mean(dim=0)
+
+    def sample_from_decoder_only(self, latent_z, pred_type='nn', link_approx='probit', n_samples=100):
+
+        if pred_type not in ['glm', 'nn']:
+            raise ValueError('Only glm and nn supported as prediction types.')
+
+        if link_approx not in ['mc', 'probit', 'bridge']:
+            raise ValueError(f'Unsupported link approximation {link_approx}.')
+
+        if pred_type == 'glm':
+            raise NotImplementedError
+        else:
+            samples, samples_latent = self._nn_predictive_decoder_samples(latent_z, n_samples)
+
+            if self.likelihood == 'regression':
+                return samples.mean(dim=0), samples.var(dim=0), samples_latent.mean(dim=0), samples_latent.var(dim=0)
+
+            else:
+                raise NotImplementedError
+
+    def _nn_predictive_decoder_samples(self, latent_z, n_samples=100):
+
+        bs, z_dim = latent_z.shape
+
+        # just dummy input. We are replacing it after the encoder anyways.
+        X = torch.zeros(bs, 1, 28, 28)
+        X = X.view(X.size(0), -1).to(self._device)
+
+        # define variable to store all the relevant information
+        z = list()
+
+        # the hook signature that just replaces the current 
+        # feature map with the given point
+        # def fw_hook(module, input, output):
+        #    output = latent_z
+        #    z.append(output.detach())
+        #self.model[4].register_forward_hook(fw_hook)
+        
+        def modify_input(latent_z):
+            def hook(module, input):
+                input[0][:,:] = latent_z
+                z.append(input[0].detach())
+            return hook
+        hook = self.model[5].register_forward_pre_hook(modify_input(latent_z))
+
+        fs = list()
+        # draw samples from the nn (sample nn)
+        def sample_diag(n_samples=100, scalar = 1):
+            samples = torch.randn(n_samples, self.n_params, device=self._device)
+            samples = samples * self.posterior_scale.reshape(1, self.n_params)
+            return self.mean.reshape(1, self.n_params) + samples * scalar #TODO: add constant and see what happens... [0 .. 1]
+
+        #samples = sample_diag(n_samples)
+        samples = self.sample(n_samples)
+        for sample in samples:
+
+            # replace the network parameters with the sampled parameters
+            vector_to_parameters(sample, self.model.parameters())
+
+            # predict with the sampled weights
+            out = self.model(X.to(self._device)).detach()
+
+            # append results
+            fs.append(out)
+
+        # reset the network parameters with the mean parameter (MAP estimate parameters)
+        vector_to_parameters(self.mean, self.model.parameters())
+
+        fs = torch.stack(fs)
+        if self.likelihood == 'classification':
+            fs = torch.softmax(fs, dim=-1)
+
+        # return both the samples in output space and latent space
+        return fs, torch.stack(z)
 
     def predictive_samples(self, x, pred_type='glm', n_samples=100):
         """Sample from the posterior predictive on input data `x`.
@@ -597,15 +677,42 @@ class ParametricLaplace(BaseLaplace):
         f_var = self.functional_variance(Js)
         return f_mu.detach(), f_var.detach()
 
-    def _nn_predictive_samples(self, X, n_samples=100):
+    def _nn_predictive_samples(self, X, n_samples=100, return_latent_representation=False):
+        
+        if return_latent_representation:
+            # define variable to store all the relevant information
+            z = list()
+            # the hook signature
+            def fw_hook(module, input, output):
+                z.append(output.detach())
+
+            self.model[4].register_forward_hook(fw_hook)
+
         fs = list()
-        for sample in self.sample(n_samples):
+        # draw samples from the nn (sample nn)
+        samples = self.sample(n_samples)
+        for sample in samples:
+
+            # replace the network parameters with the sampled parameters
             vector_to_parameters(sample, self.model.parameters())
-            fs.append(self.model(X.to(self._device)).detach())
+
+            # predict with the sampled weights
+            out = self.model(X.to(self._device)).detach()
+
+            # append results
+            fs.append(out)
+
+        # reset the network parameters with the mean parameter (MAP estimate parameters)
         vector_to_parameters(self.mean, self.model.parameters())
+
         fs = torch.stack(fs)
         if self.likelihood == 'classification':
             fs = torch.softmax(fs, dim=-1)
+
+        if return_latent_representation:
+            # return both the samples in output space and latent space
+            return fs, torch.stack(z)
+    
         return fs
 
     def functional_variance(self, Jacs):

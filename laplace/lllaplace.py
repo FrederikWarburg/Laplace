@@ -1,3 +1,4 @@
+from builtins import breakpoint
 from copy import deepcopy
 import torch
 from torch.nn.utils import parameters_to_vector, vector_to_parameters
@@ -119,16 +120,93 @@ class LLLaplace(ParametricLaplace):
         f_var = self.functional_variance(Js)
         return f_mu.detach(), f_var.detach()
 
-    def _nn_predictive_samples(self, X, n_samples=100):
+    def _nn_predictive_samples(self, X, n_samples=100, return_latent_representation = True):
+        
+        if return_latent_representation:
+            # define variable to store all the relevant information
+            z = list()
+            # the hook signature
+            def fw_hook(module, input, output):
+                z.append(output.detach())
+           
+            self.model.model[4].register_forward_hook(fw_hook)
+
         fs = list()
-        for sample in self.sample(n_samples):
+        # draw samples from the nn (sample nn)
+        samples = self.sample(n_samples)
+        for sample in samples:
+
+            # replace the network parameters with the sampled parameters
             vector_to_parameters(sample, self.model.last_layer.parameters())
-            fs.append(self.model(X.to(self._device)).detach())
+
+            # predict with the sampled weights
+            out = self.model(X.to(self._device)).detach()
+
+            # append results
+            fs.append(out)
+
+        # reset the network parameters with the mean parameter (MAP estimate parameters)
         vector_to_parameters(self.mean, self.model.last_layer.parameters())
+
         fs = torch.stack(fs)
         if self.likelihood == 'classification':
             fs = torch.softmax(fs, dim=-1)
+
+        if return_latent_representation:
+            # return both the samples in output space and latent space
+            return fs, torch.stack(z)
+    
         return fs
+
+    def _nn_predictive_decoder_samples(self, latent_z, n_samples=100):
+
+        bs, z_dim = latent_z.shape
+
+        # just dummy input. We are replacing it after the encoder anyways.
+        X = torch.zeros(bs, 1, 28, 28)
+        X = X.view(X.size(0), -1).to(self._device)
+
+        # define variable to store all the relevant information
+        z = list()
+
+        # the hook signature that just replaces the current 
+        # feature map with the given point
+        def fw_hook(module, input, output):
+            output = latent_z   
+            z.append(output.detach())
+        
+        self.model.model[4].register_forward_hook(fw_hook)
+
+        fs = list()
+        # draw samples from the nn (sample nn)
+        def sample_diag(n_samples=100, scalar = 1):
+            samples = torch.randn(n_samples, self.n_params, device=self._device)
+            samples = samples * self.posterior_scale.reshape(1, self.n_params)
+            return self.mean.reshape(1, self.n_params) + samples * scalar #TODO: add constant and see what happens... [0 .. 1]
+
+        #samples = sample_diag(n_samples)
+        samples = self.sample(n_samples)
+        for sample in samples:
+
+            # replace the network parameters with the sampled parameters
+            vector_to_parameters(sample, self.model.last_layer.parameters())
+
+            # predict with the sampled weights
+            out = self.model(X.to(self._device)).detach()
+
+            # append results
+            fs.append(out)
+
+        # reset the network parameters with the mean parameter (MAP estimate parameters)
+        vector_to_parameters(self.mean, self.model.last_layer.parameters())
+
+        fs = torch.stack(fs)
+        if self.likelihood == 'classification':
+            fs = torch.softmax(fs, dim=-1)
+
+        # return both the samples in output space and latent space
+        return fs, torch.stack(z)
+    
 
     @property
     def prior_precision_diag(self):
